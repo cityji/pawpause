@@ -190,7 +190,7 @@ impl App {
             let mut task_row = row(Vec::new())
                 .spacing(8)
                 .align_y(Alignment::Center)
-                .push(checkbox("", task.done).on_toggle(move |_| Message::ToggleDone(task.id)))
+                .push(checkbox(task.done).on_toggle(move |_| Message::ToggleDone(task.id)))
                 .push(text(title_text).width(Length::Fill));
 
             if !task.project.is_empty() {

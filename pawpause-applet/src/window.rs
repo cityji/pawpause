@@ -12,7 +12,10 @@ use cosmic::Element;
 use crate::config::{self, Config};
 use crate::outputs;
 use crate::overlay::{notify, Overlay};
-use crate::pomodoro::{Phase, Pomodoro, RunState};
+use crate::pomodoro::{Phase, Pomodoro, RunState, Transition};
+use crate::stats;
+use crate::tasks;
+use crate::wallpaper_blur::{self, WallpaperBackup};
 
 const ID: &str = "com.pawpause.Applet";
 const MIN_MINUTES: f64 = 0.5;
@@ -43,6 +46,10 @@ pub struct Window {
     overlay: Overlay,
     settings_open: bool,
     available_outputs: Vec<String>,
+    /// Set while a break's wallpaper blur is active, so it can be restored
+    /// when the break ends. In-memory only: a crash mid-break leaves the
+    /// wallpaper blurred until the next full break cycle completes.
+    wallpaper_backup: Option<WallpaperBackup>,
 }
 
 impl Default for Window {
@@ -62,6 +69,7 @@ impl Default for Window {
             overlay: Overlay::new(),
             settings_open: false,
             available_outputs: Vec::new(),
+            wallpaper_backup: None,
         }
     }
 }
@@ -92,21 +100,34 @@ pub enum Message {
 }
 
 impl Window {
-    fn handle_transition(&mut self, transition: Option<(Option<Phase>, Option<Phase>)>) {
-        let Some((old_phase, new_phase)) = transition else {
+    fn handle_transition(&mut self, transition: Option<Transition>) {
+        let Some(Transition {
+            old_phase,
+            new_phase,
+            old_phase_elapsed_secs,
+        }) = transition
+        else {
             return;
         };
 
+        if old_phase == Some(Phase::Work) && old_phase_elapsed_secs > 0 {
+            let project = tasks::load().active_project();
+            stats::log_session(&project, old_phase_elapsed_secs as u64);
+        }
+
         if old_phase.is_some_and(Phase::is_break) {
             self.overlay.stop();
+            if let Some(backup) = self.wallpaper_backup.take() {
+                wallpaper_blur::restore(backup);
+            }
         }
         if new_phase.is_some_and(Phase::is_break) {
             self.overlay.start(
                 &self.config.video_path,
                 &self.config.video_sleep_path,
                 &self.config.wayland_output,
-                self.config.blur,
             );
+            self.wallpaper_backup = wallpaper_blur::apply(&self.config.wayland_output, self.config.blur);
         }
 
         let (title, body) = match new_phase {
@@ -448,7 +469,7 @@ impl Window {
                     .push(widget::button::text("Choose…").on_press(Message::ChooseSleepVideo)),
             )
             .push(count_stepper(
-                "Video blur",
+                "Background blur",
                 self.config.blur,
                 Message::AdjustBlur(-5),
                 Message::AdjustBlur(5),

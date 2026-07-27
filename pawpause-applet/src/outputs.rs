@@ -38,3 +38,45 @@ pub fn list_outputs() -> Vec<String> {
         })
         .collect()
 }
+
+fn parse_current_resolution(text: &str, name: &str) -> Option<(u32, u32)> {
+    let mut in_target_block = false;
+    for line in text.lines() {
+        let trimmed_start = line.trim_start();
+        let is_block_header = trimmed_start == line && !trimmed_start.is_empty();
+        if is_block_header {
+            in_target_block = trimmed_start.split_whitespace().next() == Some(name);
+            continue;
+        }
+        if !in_target_block || !trimmed_start.contains("(current)") {
+            continue;
+        }
+        let dims = trimmed_start.split_whitespace().next()?;
+        let (w, h) = dims.split_once('x')?;
+        return Some((w.parse().ok()?, h.parse().ok()?));
+    }
+    None
+}
+
+/// Resolves the current mode (width, height) of the named output, e.g.
+/// `(1920, 1200)`, by parsing the `Modes:` block of `cosmic-randr list` for
+/// the line marked `(current)`. `None` if the tool or output isn't available.
+pub fn output_resolution(name: &str) -> Option<(u32, u32)> {
+    let output = Command::new("cosmic-randr").arg("list").output().ok()?;
+    let text = strip_ansi(&String::from_utf8_lossy(&output.stdout));
+    parse_current_resolution(&text, name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SAMPLE: &str = "eDP-1 (enabled)\n  Make: BOE\n  Model: 0x0B8F\n  Position: 0,0\n\n  Modes:\n    1920x1200 @  60.001 Hz (current) (preferred)\n    1920x1200 @  48.001 Hz\nHDMI-A-1 (enabled)\n  Modes:\n    1920x1080 @  60.000 Hz (current) (preferred)\n";
+
+    #[test]
+    fn parses_the_mode_marked_current_for_the_named_output() {
+        assert_eq!(parse_current_resolution(SAMPLE, "eDP-1"), Some((1920, 1200)));
+        assert_eq!(parse_current_resolution(SAMPLE, "HDMI-A-1"), Some((1920, 1080)));
+        assert_eq!(parse_current_resolution(SAMPLE, "DP-3"), None);
+    }
+}

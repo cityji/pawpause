@@ -22,7 +22,8 @@ pub struct Config {
     pub video_sleep_path: String,
     #[serde(default = "default_wayland_output")]
     pub wayland_output: String,
-    /// 0-100; blurs the break video (0 disables the filter entirely).
+    /// 0-100; blurs the desktop wallpaper (not the cat) during breaks, via
+    /// cosmic-bg. 0 disables the effect entirely.
     #[serde(default)]
     pub blur: u32,
 }

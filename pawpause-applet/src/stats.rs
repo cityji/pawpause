@@ -168,3 +168,64 @@ pub fn week_breakdown(sessions: &[SessionRecord]) -> Vec<(String, u64)> {
 pub fn format_hhmm(seconds: u64) -> String {
     format!("{:02}:{:02}", seconds / 3600, (seconds % 3600) / 60)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rec(date: &str, project: &str, seconds: u64) -> SessionRecord {
+        SessionRecord {
+            date: date.to_string(),
+            project: project.to_string(),
+            seconds,
+            ended_at_epoch: 0,
+        }
+    }
+
+    #[test]
+    fn streak_counts_consecutive_days_ending_today_or_yesterday() {
+        let today = Local::now().date_naive();
+        let y1 = today - chrono::Duration::days(1);
+        let y2 = today - chrono::Duration::days(2);
+        let sessions = vec![
+            rec(&today.format("%Y-%m-%d").to_string(), "A", 60),
+            rec(&y1.format("%Y-%m-%d").to_string(), "A", 60),
+            rec(&y2.format("%Y-%m-%d").to_string(), "A", 60),
+        ];
+        let s = summary(&sessions);
+        assert_eq!(s.day_streak, 3);
+        assert_eq!(s.days_accessed, 3);
+    }
+
+    #[test]
+    fn streak_survives_no_session_yet_today() {
+        let today = Local::now().date_naive();
+        let y1 = today - chrono::Duration::days(1);
+        let sessions = vec![rec(&y1.format("%Y-%m-%d").to_string(), "A", 60)];
+        let s = summary(&sessions);
+        assert_eq!(s.day_streak, 1);
+    }
+
+    #[test]
+    fn streak_breaks_on_gap() {
+        let today = Local::now().date_naive();
+        let gap = today - chrono::Duration::days(3);
+        let sessions = vec![rec(&gap.format("%Y-%m-%d").to_string(), "A", 60)];
+        let s = summary(&sessions);
+        assert_eq!(s.day_streak, 0);
+    }
+
+    #[test]
+    fn week_breakdown_groups_by_project_and_formats_hhmm() {
+        let today = Local::now().date_naive().format("%Y-%m-%d").to_string();
+        let sessions = vec![
+            rec(&today, "Alpha", 3600 + 1800),
+            rec(&today, "Alpha", 600),
+            rec(&today, "", 60),
+        ];
+        let rows = week_breakdown(&sessions);
+        assert_eq!(rows[0].0, "Alpha");
+        assert_eq!(format_hhmm(rows[0].1), "01:40");
+        assert_eq!(rows[1].0, "No project");
+    }
+}

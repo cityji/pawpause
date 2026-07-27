@@ -119,3 +119,32 @@ pub fn restore(backup: WallpaperBackup) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SAMPLE_RON: &str = "(\n    output: \"all\",\n    source: Path(\"/usr/share/backgrounds/cosmic/earth.jpg\"),\n    filter_by_theme: true,\n    rotation_frequency: 300,\n)";
+
+    #[test]
+    fn extracts_the_source_path() {
+        let (_, _, path) = extract_source(SAMPLE_RON).unwrap();
+        assert_eq!(path, "/usr/share/backgrounds/cosmic/earth.jpg");
+    }
+
+    #[test]
+    fn replace_source_only_touches_the_source_line() {
+        let replaced = replace_source(SAMPLE_RON, "/tmp/blurred.jpg").unwrap();
+        assert!(replaced.contains("source: Path(\"/tmp/blurred.jpg\")"));
+        assert!(replaced.contains("output: \"all\""));
+        assert!(replaced.contains("rotation_frequency: 300"));
+        // Round-trips back to the original when replaced again.
+        let restored = replace_source(&replaced, "/usr/share/backgrounds/cosmic/earth.jpg").unwrap();
+        assert_eq!(restored, SAMPLE_RON);
+    }
+
+    #[test]
+    fn missing_source_marker_returns_none() {
+        assert!(extract_source("(\n    output: \"all\",\n)").is_none());
+    }
+}

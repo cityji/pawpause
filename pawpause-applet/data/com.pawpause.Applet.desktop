@@ -1,0 +1,13 @@
+[Desktop Entry]
+Name=PawPause
+Comment=Pomodoro timer with break video overlay
+Type=Application
+Exec=/home/noob/.local/bin/pawpause-applet
+Icon=alarm-symbolic
+Terminal=false
+Categories=COSMIC;
+Keywords=COSMIC;Applet;Pomodoro;Timer;Break;
+NoDisplay=true
+X-CosmicApplet=true
+X-CosmicHoverPopup=Auto
+StartupNotify=true

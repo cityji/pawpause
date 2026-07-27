@@ -111,7 +111,7 @@ impl Window {
         };
 
         if old_phase == Some(Phase::Work) && old_phase_elapsed_secs > 0 {
-            let project = tasks::load().active_project();
+            let project = tasks::load().active_project_name();
             stats::log_session(&project, old_phase_elapsed_secs as u64);
         }
 

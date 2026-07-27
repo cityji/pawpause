@@ -341,25 +341,35 @@ impl App {
         };
         children.push(text(title).width(Length::Fill).into());
 
-        if let Some(project_id) = task.project_id {
-            if let Some(name) = self.store.project_name(project_id) {
-                children.push(project_chip(name));
+        // Project name and rolled-up progress share one compact chip instead
+        // of two separate elements — every extra element eats into the
+        // title's Length::Fill space, and rows get squeezed hard once
+        // indentation stacks up with depth.
+        let project_name = task.project_id.and_then(|id| self.store.project_name(id));
+        if project_name.is_some() || has_children {
+            let mut label = project_name.unwrap_or_default().to_string();
+            if has_children {
+                let (done, total) = self.store.progress(id);
+                if !label.is_empty() {
+                    label.push_str(" · ");
+                }
+                label.push_str(&format!("{done}/{total}"));
             }
-        }
-
-        if has_children {
-            let (done, total) = self.store.progress(id);
-            children.push(text(format!("{done}/{total}")).size(12).into());
+            children.push(project_chip(&label));
         }
 
         let star_icon = if is_active { "starred-symbolic" } else { "non-starred-symbolic" };
-        children.push(icon_button(
-            star_icon,
-            if is_active { Message::ClearActive } else { Message::SetActive(id) },
-        ));
-        children.push(icon_button("list-add-symbolic", Message::StartAddSubtask(id)));
-        children.push(icon_button("document-edit-symbolic", Message::StartEdit(id)));
-        children.push(icon_button("user-trash-symbolic", Message::DeleteTask(id)));
+        let actions = row(vec![
+            icon_button(
+                star_icon,
+                if is_active { Message::ClearActive } else { Message::SetActive(id) },
+            ),
+            icon_button("list-add-symbolic", Message::StartAddSubtask(id)),
+            icon_button("document-edit-symbolic", Message::StartEdit(id)),
+            icon_button("user-trash-symbolic", Message::DeleteTask(id)),
+        ])
+        .spacing(2);
+        children.push(actions.into());
 
         widget::settings::item_row(children).into()
     }
@@ -478,6 +488,6 @@ fn stat_tile<'a>(label: &'a str, value: String) -> Element<'a, Message> {
 fn main() -> cosmic::iced::Result {
     let env = env_logger::Env::default().filter_or("PAWPAUSE_LOG", "warn");
     env_logger::init_from_env(env);
-    let settings = Settings::default().size(Size::new(720.0, 560.0));
+    let settings = Settings::default().size(Size::new(920.0, 640.0));
     cosmic::app::run::<App>(settings, ())
 }

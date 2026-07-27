@@ -1,30 +1,40 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+use crate::overlay::notify;
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Config {
     #[serde(default = "default_work_minutes")]
-    pub work_minutes: u64,
+    pub work_minutes: f64,
     #[serde(default = "default_short_break_minutes")]
-    pub short_break_minutes: u64,
+    pub short_break_minutes: f64,
     #[serde(default = "default_long_break_minutes")]
-    pub long_break_minutes: u64,
+    pub long_break_minutes: f64,
     #[serde(default = "default_sessions_before_long_break")]
     pub sessions_before_long_break: u32,
     #[serde(default = "default_video_path")]
     pub video_path: String,
+    /// Optional looping "sleep" clip played after `video_path` finishes once
+    /// (mirrors cat-gatekeeper's walk-in-then-sleep behavior). Empty or equal
+    /// to `video_path` means just loop `video_path` on its own.
+    #[serde(default)]
+    pub video_sleep_path: String,
     #[serde(default = "default_wayland_output")]
     pub wayland_output: String,
+    /// 0-100; blurs the break video (0 disables the filter entirely).
+    #[serde(default)]
+    pub blur: u32,
 }
 
-fn default_work_minutes() -> u64 {
-    25
+fn default_work_minutes() -> f64 {
+    25.0
 }
-fn default_short_break_minutes() -> u64 {
-    5
+fn default_short_break_minutes() -> f64 {
+    5.0
 }
-fn default_long_break_minutes() -> u64 {
-    20
+fn default_long_break_minutes() -> f64 {
+    20.0
 }
 fn default_sessions_before_long_break() -> u32 {
     4
@@ -49,7 +59,9 @@ impl Default for Config {
             long_break_minutes: default_long_break_minutes(),
             sessions_before_long_break: default_sessions_before_long_break(),
             video_path: default_video_path(),
+            video_sleep_path: String::new(),
             wayland_output: default_wayland_output(),
+            blur: 0,
         }
     }
 }
@@ -63,6 +75,8 @@ pub fn config_path() -> PathBuf {
 }
 
 /// Loads ~/.config/pawpause/config, creating it with defaults if missing.
+/// A config that fails to parse falls back to defaults but notifies the
+/// user, rather than silently discarding their settings.
 /// Returns (config, created).
 pub fn load_or_create() -> (Config, bool) {
     let path = config_path();
@@ -71,15 +85,39 @@ pub fn load_or_create() -> (Config, bool) {
             let _ = std::fs::create_dir_all(parent);
         }
         let cfg = Config::default();
-        if let Ok(json) = serde_json::to_string_pretty(&cfg) {
-            let _ = std::fs::write(&path, format!("{json}\n"));
-        }
+        save(&cfg);
         return (cfg, true);
     }
 
-    let cfg = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default();
-    (cfg, false)
+    match std::fs::read_to_string(&path) {
+        Ok(contents) => match serde_json::from_str(&contents) {
+            Ok(cfg) => (cfg, false),
+            Err(err) => {
+                notify(
+                    "PawPause",
+                    &format!("Config at {} is invalid ({err}) — using defaults.", path.display()),
+                );
+                (Config::default(), false)
+            }
+        },
+        Err(err) => {
+            notify("PawPause", &format!("Could not read config: {err} — using defaults."));
+            (Config::default(), false)
+        }
+    }
+}
+
+pub fn save(config: &Config) {
+    let path = config_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    match serde_json::to_string_pretty(config) {
+        Ok(json) => {
+            if let Err(err) = std::fs::write(&path, format!("{json}\n")) {
+                notify("PawPause", &format!("Could not save config: {err}"));
+            }
+        }
+        Err(err) => notify("PawPause", &format!("Could not serialize config: {err}")),
+    }
 }

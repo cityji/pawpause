@@ -1,4 +1,5 @@
 mod config;
+mod outputs;
 mod overlay;
 mod pomodoro;
 mod window;

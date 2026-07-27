@@ -52,7 +52,7 @@ impl Pomodoro {
             Phase::ShortBreak => config.short_break_minutes,
             Phase::LongBreak => config.long_break_minutes,
         };
-        (minutes * 60) as i64
+        (minutes * 60.0).round() as i64
     }
 
     fn advance(phase: Phase, session_count: u32, config: &Config) -> (Phase, u32) {

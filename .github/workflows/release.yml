@@ -1,0 +1,73 @@
+name: Release
+
+# Builds happen on GitHub's runners, not locally — so a release never depends
+# on the maintainer's own disk space or toolchain state. Push a tag matching
+# v*.*.* (e.g. v0.1.0) to publish a new release automatically.
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (e.g. v0.1.0)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev pkg-config
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: pawpause-applet
+
+      - name: Build release binaries
+        working-directory: pawpause-applet
+        run: cargo build --release
+
+      - name: Run tests
+        working-directory: pawpause-applet
+        run: cargo test --release
+
+      - name: Determine release tag
+        id: tag
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Package release archive
+        run: |
+          DIST="pawpause-${{ steps.tag.outputs.version }}-x86_64-linux"
+          mkdir -p "$DIST"
+          cp pawpause-applet/target/release/pawpause "$DIST/"
+          cp pawpause-applet/target/release/pawpause-applet "$DIST/"
+          cp pawpause-applet/data/*.desktop "$DIST/"
+          cp README.md LICENSE "$DIST/"
+          tar czf "${DIST}.tar.gz" "$DIST"
+          sha256sum "${DIST}.tar.gz" > "${DIST}.tar.gz.sha256"
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: PawPause ${{ steps.tag.outputs.tag }}
+          generate_release_notes: true
+          files: |
+            pawpause-*-x86_64-linux.tar.gz
+            pawpause-*-x86_64-linux.tar.gz.sha256

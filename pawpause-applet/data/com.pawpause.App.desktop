@@ -2,7 +2,7 @@
 Name=PawPause
 Comment=Tasks and focus statistics for PawPause
 Type=Application
-Exec=/home/noob/.local/bin/pawpause
+Exec=pawpause
 Icon=alarm-symbolic
 Terminal=false
 Categories=Utility;

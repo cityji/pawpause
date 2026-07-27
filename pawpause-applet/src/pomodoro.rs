@@ -35,6 +35,9 @@ pub struct Transition {
     pub old_phase: Option<Phase>,
     pub new_phase: Option<Phase>,
     pub old_phase_elapsed_secs: i64,
+    /// True only when the phase ended by natural expiry (tick() hit 0);
+    /// false for skip()/stop(). Meaningless when old_phase is None.
+    pub completed: bool,
 }
 
 /// A minimal Pomodoro state machine, driven by an external 1s tick().
@@ -102,6 +105,7 @@ impl Pomodoro {
             old_phase: None,
             new_phase: self.phase,
             old_phase_elapsed_secs: 0,
+            completed: false,
         })
     }
 
@@ -129,6 +133,7 @@ impl Pomodoro {
             old_phase: Some(old_phase),
             new_phase: Some(new_phase),
             old_phase_elapsed_secs,
+            completed: false,
         })
     }
 
@@ -144,6 +149,7 @@ impl Pomodoro {
             old_phase: Some(p),
             new_phase: None,
             old_phase_elapsed_secs,
+            completed: false,
         })
     }
 
@@ -170,7 +176,14 @@ impl Pomodoro {
             old_phase: Some(phase),
             new_phase: Some(new_phase),
             old_phase_elapsed_secs,
+            completed: true,
         })
+    }
+
+    /// The full planned duration (seconds) of the phase currently in
+    /// progress, for driving a progress bar. 0 if idle.
+    pub fn current_phase_duration_secs(&self) -> i64 {
+        self.current_phase_duration
     }
 
     pub fn status_text(&self) -> String {

@@ -13,7 +13,7 @@ path = "src/main.rs"
 
 [[bin]]
 name = "pawpause"
-path = "src/bin/pawpause.rs"
+path = "src/bin/pawpause/main.rs"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

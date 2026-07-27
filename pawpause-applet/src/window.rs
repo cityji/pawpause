@@ -3,11 +3,11 @@ use std::time::Duration;
 use cosmic::app::{Core, Task};
 use cosmic::iced::core::window;
 use cosmic::iced::window::Id;
-use cosmic::iced::{Alignment, Length, Rectangle, Subscription};
+use cosmic::iced::{Alignment, Background, Border, Color, Length, Rectangle, Subscription};
 use cosmic::surface::action::{app_popup, destroy_popup};
 use cosmic::widget::dropdown::popup_dropdown;
-use cosmic::widget::{self, column, row, text, text_input};
-use cosmic::Element;
+use cosmic::widget::{self, column, container, row, text, text_input, Space};
+use cosmic::{Element, Theme};
 
 use crate::config::{self, Config};
 use crate::outputs;
@@ -83,11 +83,11 @@ pub enum Message {
     Skip,
     Stop,
     ToggleSettings,
-    AdjustWorkMinutes(f64),
-    AdjustShortBreakMinutes(f64),
-    AdjustLongBreakMinutes(f64),
-    AdjustSessions(i32),
-    AdjustBlur(i32),
+    SetWorkMinutes(f64),
+    SetShortBreakMinutes(f64),
+    SetLongBreakMinutes(f64),
+    SetSessions(u32),
+    SetBlur(u32),
     VideoPathInput(String),
     ChooseVideo,
     VideoChosen(Option<String>),
@@ -105,6 +105,7 @@ impl Window {
             old_phase,
             new_phase,
             old_phase_elapsed_secs,
+            completed,
         }) = transition
         else {
             return;
@@ -112,7 +113,7 @@ impl Window {
 
         if old_phase == Some(Phase::Work) && old_phase_elapsed_secs > 0 {
             let project = tasks::load().active_project_name();
-            stats::log_session(&project, old_phase_elapsed_secs as u64);
+            stats::log_session(&project, old_phase_elapsed_secs as u64, completed);
         }
 
         if old_phase.is_some_and(Phase::is_break) {
@@ -126,6 +127,7 @@ impl Window {
                 &self.config.video_path,
                 &self.config.video_sleep_path,
                 &self.config.wayland_output,
+                self.pomodoro.current_phase_duration_secs() as f64,
             );
             self.wallpaper_backup = wallpaper_blur::apply(&self.config.wayland_output, self.config.blur);
         }
@@ -161,6 +163,58 @@ impl Window {
     fn save_config(&self) {
         config::save(&self.config);
     }
+
+    /// Progress through the current phase, 0.0-1.0. 0.0 while idle.
+    fn progress(&self) -> f32 {
+        let total = self.pomodoro.current_phase_duration_secs();
+        if total <= 0 {
+            return 0.0;
+        }
+        (1.0 - (self.pomodoro.remaining.max(0) as f32 / total as f32)).clamp(0.0, 1.0)
+    }
+
+    /// How many dots in the current `goal`-sized cycle should read as
+    /// "filled" — mirrors the reference applet's dot semantics: the
+    /// in-progress Work session's dot counts as filled too, not just fully
+    /// completed ones, so the row reads "session N of goal" while working.
+    fn completed_in_cycle(&self, goal: u32) -> u32 {
+        match self.pomodoro.phase {
+            Some(Phase::Work) => (self.pomodoro.session_count % goal) + 1,
+            Some(Phase::LongBreak) => goal,
+            _ => self.pomodoro.session_count % goal,
+        }
+    }
+}
+
+fn phase_color(theme: &Theme, phase: Option<Phase>) -> Color {
+    let c = theme.cosmic();
+    match phase {
+        None => c.bg_component_color().into(),
+        Some(Phase::Work) => c.destructive_color().into(),
+        Some(Phase::ShortBreak) => c.success_color().into(),
+        Some(Phase::LongBreak) => c.accent_color().into(),
+    }
+}
+
+fn muted(color: Color, alpha: f32) -> Color {
+    Color { a: alpha, ..color }
+}
+
+fn colored_bg(color: Color, radius: f32) -> impl Fn(&Theme) -> container::Style {
+    move |_theme: &Theme| container::Style {
+        background: Some(Background::Color(color)),
+        border: Border {
+            radius: radius.into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+fn dot(filled: bool, color: Color) -> Element<'static, Message> {
+    container(Space::new().width(Length::Fixed(8.0)).height(Length::Fixed(8.0)))
+        .style(colored_bg(if filled { color } else { muted(color, 0.25) }, 4.0))
+        .into()
 }
 
 impl cosmic::Application for Window {
@@ -230,28 +284,24 @@ impl cosmic::Application for Window {
                     self.available_outputs = outputs::list_outputs();
                 }
             }
-            Message::AdjustWorkMinutes(delta) => {
-                self.config.work_minutes = (self.config.work_minutes + delta).max(MIN_MINUTES);
+            Message::SetWorkMinutes(value) => {
+                self.config.work_minutes = value.max(MIN_MINUTES);
                 self.save_config();
             }
-            Message::AdjustShortBreakMinutes(delta) => {
-                self.config.short_break_minutes =
-                    (self.config.short_break_minutes + delta).max(MIN_MINUTES);
+            Message::SetShortBreakMinutes(value) => {
+                self.config.short_break_minutes = value.max(MIN_MINUTES);
                 self.save_config();
             }
-            Message::AdjustLongBreakMinutes(delta) => {
-                self.config.long_break_minutes =
-                    (self.config.long_break_minutes + delta).max(MIN_MINUTES);
+            Message::SetLongBreakMinutes(value) => {
+                self.config.long_break_minutes = value.max(MIN_MINUTES);
                 self.save_config();
             }
-            Message::AdjustSessions(delta) => {
-                let current = self.config.sessions_before_long_break as i32;
-                self.config.sessions_before_long_break = (current + delta).max(1) as u32;
+            Message::SetSessions(value) => {
+                self.config.sessions_before_long_break = value.max(1);
                 self.save_config();
             }
-            Message::AdjustBlur(delta) => {
-                let current = self.config.blur as i32;
-                self.config.blur = (current + delta).clamp(0, 100) as u32;
+            Message::SetBlur(value) => {
+                self.config.blur = value.min(100);
                 self.save_config();
             }
             Message::VideoPathInput(value) => {
@@ -387,27 +437,72 @@ impl cosmic::Application for Window {
 
 impl Window {
     fn controls_view(&self) -> Element<'_, Message> {
+        let theme = cosmic::theme::active();
+        let phase = self.pomodoro.phase;
+        let accent = phase_color(&theme, phase);
+
+        let phase_label = match (phase, self.pomodoro.state) {
+            (None, _) => "Idle".to_string(),
+            (Some(p), RunState::Paused) => format!("{} (paused)", p.label()),
+            (Some(p), _) => p.label().to_string(),
+        };
+
+        let timer_card = container(
+            column(Vec::new())
+                .align_x(Alignment::Center)
+                .spacing(4)
+                .push(text::heading(phase_label))
+                .push(text::title1(self.pomodoro.short_time_text())),
+        )
+        .width(Length::Fill)
+        .padding([16, 20])
+        .align_x(Alignment::Center)
+        .style(colored_bg(muted(accent, 0.3), 12.0));
+
+        let progress_bar = widget::progress_bar::determinate_linear(self.progress())
+            .girth(Length::Fixed(6.0))
+            .width(Length::Fill);
+
+        let goal = self.config.sessions_before_long_break.max(1);
+        let filled = self.completed_in_cycle(goal);
+        let mut dots = row(Vec::new()).spacing(6).align_y(Alignment::Center);
+        for i in 0..goal {
+            dots = dots.push(dot(i < filled, accent));
+        }
+
         let toggle_label = match self.pomodoro.state {
             RunState::Running => "Pause",
             RunState::Paused => "Resume",
             RunState::Idle => "Pause",
         };
-
-        let mut list = column(Vec::new())
-            .padding(10)
-            .spacing(8)
-            .push(text(self.pomodoro.status_text()).size(16));
-
-        list = if self.pomodoro.state == RunState::Idle {
-            list.push(widget::button::text("Start Pomodoro").on_press(Message::Start))
+        let actions: Element<'_, Message> = if self.pomodoro.state == RunState::Idle {
+            row(Vec::new())
+                .push(widget::button::suggested("Start Pomodoro").on_press(Message::Start))
+                .into()
         } else {
-            list.push(widget::button::text(toggle_label).on_press(Message::PauseResume))
-                .push(widget::button::text("Skip").on_press(Message::Skip))
-                .push(widget::button::text("Stop/Reset").on_press(Message::Stop))
+            row(Vec::new())
+                .spacing(8)
+                .push(widget::button::standard(toggle_label).on_press(Message::PauseResume))
+                .push(widget::button::standard("Skip").on_press(Message::Skip))
+                .push(widget::button::destructive("Stop").on_press(Message::Stop))
+                .into()
         };
 
-        list.push(widget::button::text("Settings").on_press(Message::ToggleSettings))
-            .push(widget::button::text("Open PawPause").on_press(Message::OpenApp))
+        column(Vec::new())
+            .padding(10)
+            .spacing(10)
+            .align_x(Alignment::Center)
+            .push(timer_card)
+            .push(progress_bar)
+            .push(dots)
+            .push(actions)
+            .push(widget::divider::horizontal::default())
+            .push(
+                row(Vec::new())
+                    .spacing(8)
+                    .push(widget::button::text("Settings").on_press(Message::ToggleSettings))
+                    .push(widget::button::text("Open PawPause").on_press(Message::OpenApp)),
+            )
             .into()
     }
 
@@ -418,34 +513,55 @@ impl Window {
             .iter()
             .position(|name| name == &self.config.wayland_output);
 
-        column(Vec::new())
+        let timing = widget::list_column()
+            .add(minute_spin_button(
+                "Work minutes",
+                self.config.work_minutes,
+                Message::SetWorkMinutes,
+            ))
+            .add(minute_spin_button(
+                "Short break minutes",
+                self.config.short_break_minutes,
+                Message::SetShortBreakMinutes,
+            ))
+            .add(minute_spin_button(
+                "Long break minutes",
+                self.config.long_break_minutes,
+                Message::SetLongBreakMinutes,
+            ))
+            .add(widget::settings::item_row(vec![
+                text("Sessions before long break").width(Length::Fill).into(),
+                widget::spin_button::spin_button(
+                    format!("{}", self.config.sessions_before_long_break),
+                    "Sessions before long break",
+                    self.config.sessions_before_long_break,
+                    1,
+                    1,
+                    20,
+                    Message::SetSessions,
+                )
+                .into(),
+            ]))
+            .add(widget::settings::item_row(vec![
+                text("Background blur").width(Length::Fill).into(),
+                widget::spin_button::spin_button(
+                    format!("{}%", self.config.blur),
+                    "Background blur",
+                    self.config.blur,
+                    5,
+                    0,
+                    100,
+                    Message::SetBlur,
+                )
+                .into(),
+            ]));
+
+        let body = column(Vec::new())
             .padding(10)
             .spacing(10)
             .push(text("Settings").size(16))
-            .push(minute_stepper(
-                "Work",
-                self.config.work_minutes,
-                Message::AdjustWorkMinutes(-MINUTE_STEP),
-                Message::AdjustWorkMinutes(MINUTE_STEP),
-            ))
-            .push(minute_stepper(
-                "Short break",
-                self.config.short_break_minutes,
-                Message::AdjustShortBreakMinutes(-MINUTE_STEP),
-                Message::AdjustShortBreakMinutes(MINUTE_STEP),
-            ))
-            .push(minute_stepper(
-                "Long break",
-                self.config.long_break_minutes,
-                Message::AdjustLongBreakMinutes(-MINUTE_STEP),
-                Message::AdjustLongBreakMinutes(MINUTE_STEP),
-            ))
-            .push(count_stepper(
-                "Sessions before long break",
-                self.config.sessions_before_long_break,
-                Message::AdjustSessions(-1),
-                Message::AdjustSessions(1),
-            ))
+            .push(timing)
+            .push(widget::divider::horizontal::default())
             .push(text("Break video"))
             .push(
                 row(Vec::new())
@@ -468,12 +584,7 @@ impl Window {
                     )
                     .push(widget::button::text("Choose…").on_press(Message::ChooseSleepVideo)),
             )
-            .push(count_stepper(
-                "Background blur",
-                self.config.blur,
-                Message::AdjustBlur(-5),
-                Message::AdjustBlur(5),
-            ))
+            .push(widget::divider::horizontal::default())
             .push(text("Wayland output"))
             .push(popup_dropdown(
                 output_names,
@@ -483,39 +594,21 @@ impl Window {
                 Message::Surface,
                 |m| m,
             ))
-            .push(widget::button::text("Back").on_press(Message::ToggleSettings))
-            .into()
+            .push(widget::button::text("Back").on_press(Message::ToggleSettings));
+
+        widget::scrollable(body).height(Length::Fixed(340.0)).into()
     }
 }
 
-fn minute_stepper<'a>(
+fn minute_spin_button<'a>(
     label: &'a str,
     value: f64,
-    dec: Message,
-    inc: Message,
+    on_change: fn(f64) -> Message,
 ) -> Element<'a, Message> {
-    row(Vec::new())
-        .align_y(Alignment::Center)
-        .spacing(8)
-        .push(text(label).width(Length::Fill))
-        .push(widget::button::text("-").on_press(dec))
-        .push(text(format!("{value:.1} min")))
-        .push(widget::button::text("+").on_press(inc))
-        .into()
-}
-
-fn count_stepper<'a>(
-    label: &'a str,
-    value: u32,
-    dec: Message,
-    inc: Message,
-) -> Element<'a, Message> {
-    row(Vec::new())
-        .align_y(Alignment::Center)
-        .spacing(8)
-        .push(text(label).width(Length::Fill))
-        .push(widget::button::text("-").on_press(dec))
-        .push(text(format!("{value}")))
-        .push(widget::button::text("+").on_press(inc))
-        .into()
+    widget::settings::item_row(vec![
+        text(label).width(Length::Fill).into(),
+        widget::spin_button::spin_button(format!("{value:.1} min"), label, value, MINUTE_STEP, MIN_MINUTES, 180.0, on_change)
+            .into(),
+    ])
+    .into()
 }

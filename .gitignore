@@ -2,6 +2,6 @@ venv/
 __pycache__/
 *.pyc
 target/
-
+CLAUDE.md
 
 !pawpause-applet/data/**

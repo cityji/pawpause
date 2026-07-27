@@ -1,11 +1,16 @@
 use std::collections::HashSet;
 
+mod chart;
+
+use chrono::{Local, NaiveDate};
 use cosmic::app::{Core, Settings, Task};
 use cosmic::iced::{Alignment, Length, Size};
 use cosmic::widget::dropdown::dropdown;
 use cosmic::widget::{self, checkbox, column, icon, nav_bar, row, text, text_input, Space};
 use cosmic::{theme, Element};
 
+use pawpause_applet::config::{self, Config};
+use pawpause_applet::laptop_usage::{self, BootSession};
 use pawpause_applet::stats::{self, format_hhmm};
 use pawpause_applet::tasks::{self, TasksStore};
 
@@ -24,6 +29,8 @@ struct App {
     nav_model: nav_bar::Model,
     store: TasksStore,
     sessions: Vec<stats::SessionRecord>,
+    config: Config,
+    boot_sessions: Vec<BootSession>,
 
     /// Nodes whose children are hidden. Empty by default — everything starts
     /// expanded.
@@ -65,6 +72,10 @@ enum Message {
     AddProject,
     ArchiveProject(u64),
     RestoreProject(u64),
+
+    SetDailyGoal(u32),
+    ExportCsv,
+    ExportCsvDone,
 }
 
 impl App {
@@ -118,11 +129,14 @@ impl cosmic::Application for App {
         nav_model.insert().text("Statistics").data(Page::Statistics);
         nav_model.activate_position(0);
 
+        let (config, _created) = config::load_or_create();
         let app = App {
             core,
             nav_model,
             store: tasks::load(),
             sessions: stats::load_sessions(),
+            config,
+            boot_sessions: laptop_usage::list_boot_sessions(200),
             collapsed: HashSet::new(),
             new_task_title: String::new(),
             new_task_project: None,
@@ -143,7 +157,10 @@ impl cosmic::Application for App {
     fn on_nav_select(&mut self, id: nav_bar::Id) -> Task<Message> {
         self.nav_model.activate(id);
         match self.nav_model.active_data::<Page>() {
-            Some(Page::Statistics) => self.sessions = stats::load_sessions(),
+            Some(Page::Statistics) => {
+                self.sessions = stats::load_sessions();
+                self.boot_sessions = laptop_usage::list_boot_sessions(200);
+            }
             _ => self.store = tasks::load(),
         }
         Task::none()
@@ -235,6 +252,44 @@ impl cosmic::Application for App {
                 self.store.set_project_archived(id, false);
                 self.save_tasks();
             }
+
+            Message::SetDailyGoal(value) => {
+                self.config.daily_goal_minutes = value;
+                config::save(&self.config);
+            }
+            Message::ExportCsv => {
+                let sessions = self.sessions.clone();
+                return Task::perform(
+                    async move {
+                        let Some(handle) = rfd::AsyncFileDialog::new()
+                            .set_title("Export sessions to CSV")
+                            .set_file_name("pawpause-sessions.csv")
+                            .save_file()
+                            .await
+                        else {
+                            return;
+                        };
+
+                        let mut csv = String::from("date,project,seconds,completed\n");
+                        for s in &sessions {
+                            let completed = match s.completed {
+                                Some(true) => "true",
+                                Some(false) => "false",
+                                None => "",
+                            };
+                            csv.push_str(&format!("{},{},{},{}\n", s.date, s.project.replace(',', " "), s.seconds, completed));
+                        }
+
+                        if let Err(err) = std::fs::write(handle.path(), csv) {
+                            pawpause_applet::overlay::notify("PawPause", &format!("Could not export CSV: {err}"));
+                        } else {
+                            pawpause_applet::overlay::notify("PawPause", "Exported sessions to CSV.");
+                        }
+                    },
+                    |()| cosmic::Action::App(Message::ExportCsvDone),
+                );
+            }
+            Message::ExportCsvDone => {}
         }
         Task::none()
     }
@@ -439,14 +494,63 @@ impl App {
     }
 
     fn statistics_view(&self) -> Element<'_, Message> {
+        let theme = cosmic::theme::active();
+        let cosmic_theme = theme.cosmic();
+        let work_color: cosmic::iced::Color = cosmic_theme.destructive_color().into();
+        let neutral_color: cosmic::iced::Color = cosmic_theme.bg_component_color().into();
+        let text_color: cosmic::iced::Color = cosmic_theme.on_bg_color().into();
+
         let summary = stats::summary(&self.sessions);
         let breakdown = stats::week_breakdown(&self.sessions);
+        let daily_14 = stats::daily_breakdown(&self.sessions, 14);
+        let daily_84 = stats::daily_breakdown(&self.sessions, 84);
+        let completion = stats::completion_summary(&self.sessions);
+        let laptop_daily = zero_fill_minutes(&laptop_usage::daily_usage_minutes(&self.boot_sessions), 14)
+            .into_iter()
+            .map(|(d, m)| (d, m * 60))
+            .collect::<Vec<_>>();
+
+        let today_seconds = daily_14.last().map(|(_, s)| *s).unwrap_or(0);
+        let yesterday_seconds = daily_14.get(daily_14.len().saturating_sub(2)).map(|(_, s)| *s).unwrap_or(0);
 
         let tiles = row(Vec::new())
             .spacing(16)
             .push(stat_tile("Hours focused", format!("{:.1}", summary.hours_focused)))
             .push(stat_tile("Days accessed", summary.days_accessed.to_string()))
-            .push(stat_tile("Day streak", summary.day_streak.to_string()));
+            .push(stat_tile("Day streak", summary.day_streak.to_string()))
+            .push(stat_tile("Today vs yesterday", format!("{} / {}", format_hhmm(today_seconds), format_hhmm(yesterday_seconds))));
+
+        let mut goal_section = column(Vec::new()).spacing(6);
+        if self.config.daily_goal_minutes > 0 {
+            let goal_secs = self.config.daily_goal_minutes as u64 * 60;
+            let ratio = (today_seconds as f32 / goal_secs as f32).clamp(0.0, 1.0);
+            goal_section = goal_section
+                .push(text(format!(
+                    "Today's goal: {} / {} min",
+                    today_seconds / 60,
+                    self.config.daily_goal_minutes
+                )))
+                .push(widget::progress_bar::determinate_linear(ratio).girth(Length::Fixed(6.0)).width(Length::Fill));
+        }
+        goal_section = goal_section.push(
+            row(Vec::new())
+                .spacing(8)
+                .align_y(Alignment::Center)
+                .push(text("Daily focus goal").width(Length::Fill))
+                .push(widget::spin_button::spin_button(
+                    if self.config.daily_goal_minutes == 0 {
+                        "Off".to_string()
+                    } else {
+                        format!("{} min", self.config.daily_goal_minutes)
+                    },
+                    "Daily focus goal in minutes",
+                    self.config.daily_goal_minutes,
+                    15,
+                    0,
+                    600,
+                    Message::SetDailyGoal,
+                )),
+        );
 
         let mut table = widget::list_column();
         if breakdown.is_empty() {
@@ -460,15 +564,101 @@ impl App {
             }
         }
 
-        column(Vec::new())
+        let week_chart = chart_card(
+            widget::canvas(chart::BarChart {
+                bars: breakdown,
+                color: work_color,
+                text_color,
+                max_bars: 8,
+            })
+            .height(Length::Fixed(160.0)),
+        );
+
+        let trend_chart = chart_card(
+            widget::canvas(chart::TrendChart {
+                points: daily_14.clone(),
+                color: work_color,
+                text_color,
+                fill: true,
+            })
+            .height(Length::Fixed(140.0)),
+        );
+
+        let heatmap = chart_card(
+            widget::canvas(chart::HeatmapCalendar {
+                days: daily_84,
+                base_color: work_color,
+                text_color,
+                weeks: 12,
+            })
+            .height(Length::Fixed(120.0)),
+        );
+
+        let laptop_chart = chart_card(
+            widget::canvas(chart::TrendChart {
+                points: laptop_daily,
+                color: neutral_color,
+                text_color,
+                fill: true,
+            })
+            .height(Length::Fixed(140.0)),
+        );
+
+        let completion_caption = text(format!(
+            "{} completed · {} skipped/stopped · {} from before completion-tracking",
+            completion.completed, completion.skipped_or_stopped, completion.unknown
+        ))
+        .size(12);
+
+        let body = column(Vec::new())
             .padding(16)
             .spacing(16)
-            .push(text("Activity Summary").size(20))
+            .push(
+                row(Vec::new())
+                    .align_y(Alignment::Center)
+                    .push(text("Activity Summary").size(20).width(Length::Fill))
+                    .push(widget::button::text("Export CSV").on_press(Message::ExportCsv)),
+            )
             .push(tiles)
+            .push(goal_section)
             .push(text("Focus Hours This Week").size(16))
+            .push(week_chart)
             .push(table)
-            .into()
+            .push(text("Daily Focus — Last 14 Days").size(16))
+            .push(trend_chart)
+            .push(completion_caption)
+            .push(text("Focus Activity — Last 12 Weeks").size(16))
+            .push(heatmap)
+            .push(text("Laptop Usage — Last 14 Days").size(16))
+            .push(laptop_chart);
+
+        widget::scrollable(body).into()
     }
+}
+
+fn chart_card<'a>(
+    canvas: widget::Canvas<impl cosmic::iced::widget::canvas::Program<Message, cosmic::Theme> + 'a, Message, cosmic::Theme>,
+) -> Element<'a, Message> {
+    widget::container(canvas.width(Length::Fill))
+        .class(theme::Container::Card)
+        .padding(12)
+        .width(Length::Fill)
+        .into()
+}
+
+/// Zero-filled, ascending-date minute totals for the last `days` calendar
+/// days ending today — mirrors `stats::daily_breakdown`'s shape so the
+/// laptop-usage trend chart reads consistently with the pomodoro one.
+fn zero_fill_minutes(daily: &[(NaiveDate, u64)], days: u32) -> Vec<(NaiveDate, u64)> {
+    let today = Local::now().date_naive();
+    let totals: std::collections::BTreeMap<NaiveDate, u64> = daily.iter().copied().collect();
+    (0..days)
+        .rev()
+        .map(|offset| {
+            let date = today - chrono::Duration::days(offset as i64);
+            (date, totals.get(&date).copied().unwrap_or(0))
+        })
+        .collect()
 }
 
 fn stat_tile<'a>(label: &'a str, value: String) -> Element<'a, Message> {

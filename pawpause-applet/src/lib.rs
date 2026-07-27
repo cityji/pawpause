@@ -1,4 +1,6 @@
+pub mod ansi;
 pub mod config;
+pub mod laptop_usage;
 pub mod outputs;
 pub mod overlay;
 pub mod pomodoro;

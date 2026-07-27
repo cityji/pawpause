@@ -26,6 +26,10 @@ pub struct Config {
     /// cosmic-bg. 0 disables the effect entirely.
     #[serde(default)]
     pub blur: u32,
+    /// Daily focused-minutes target shown on the Statistics page. 0 disables
+    /// the goal indicator entirely (same "0 disables" convention as `blur`).
+    #[serde(default)]
+    pub daily_goal_minutes: u32,
 }
 
 fn default_work_minutes() -> f64 {
@@ -63,6 +67,7 @@ impl Default for Config {
             video_sleep_path: String::new(),
             wayland_output: default_wayland_output(),
             blur: 0,
+            daily_goal_minutes: 0,
         }
     }
 }

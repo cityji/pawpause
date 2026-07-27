@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=PawPause
+Comment=Tasks and focus statistics for PawPause
+Type=Application
+Exec=/home/noob/.local/bin/pawpause
+Icon=alarm-symbolic
+Terminal=false
+Categories=Utility;
+Keywords=Pomodoro;Tasks;Focus;Statistics;
+StartupNotify=true

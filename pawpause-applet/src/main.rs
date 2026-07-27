@@ -1,10 +1,4 @@
-mod config;
-mod outputs;
-mod overlay;
-mod pomodoro;
-mod window;
-
-use crate::window::Window;
+use pawpause_applet::window::Window;
 
 fn main() -> cosmic::iced::Result {
     let env = env_logger::Env::default().filter_or("PAWPAUSE_LOG", "warn");

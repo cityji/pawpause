@@ -3,9 +3,17 @@ name = "pawpause-applet"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "pawpause_applet"
+path = "src/lib.rs"
+
 [[bin]]
 name = "pawpause-applet"
 path = "src/main.rs"
+
+[[bin]]
+name = "pawpause"
+path = "src/bin/pawpause.rs"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -14,8 +22,19 @@ dirs = "5"
 env_logger = "0.10"
 log = "0.4"
 rfd = "0.15"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 [dependencies.libcosmic]
 git = "https://github.com/pop-os/libcosmic"
 default-features = false
-features = ["applet-token"]
+features = [
+    "applet-token",
+    "wayland",
+    "winit",
+    "tokio",
+    "wgpu",
+    "xdg-portal",
+    "a11y",
+    "single-instance",
+    "multi-window",
+]

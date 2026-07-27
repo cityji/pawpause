@@ -18,6 +18,23 @@ const ID: &str = "com.pawpause.Applet";
 const MIN_MINUTES: f64 = 0.5;
 const MINUTE_STEP: f64 = 1.0;
 
+/// Launches the standalone `pawpause` window (Tasks + Statistics), preferring
+/// the copy installed alongside this applet binary and falling back to PATH.
+fn open_companion_app() {
+    let sibling = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join("pawpause")));
+
+    let mut command = match sibling.filter(|path| path.is_file()) {
+        Some(path) => std::process::Command::new(path),
+        None => std::process::Command::new("pawpause"),
+    };
+
+    if let Err(err) = command.spawn() {
+        notify("PawPause", &format!("Could not open PawPause: {err}"));
+    }
+}
+
 pub struct Window {
     core: Core,
     popup: Option<Id>,
@@ -71,6 +88,7 @@ pub enum Message {
     SleepVideoChosen(Option<String>),
     OutputSelected(usize),
     Surface(cosmic::surface::Action),
+    OpenApp,
 }
 
 impl Window {
@@ -270,6 +288,9 @@ impl cosmic::Application for Window {
                     action,
                 )));
             }
+            Message::OpenApp => {
+                open_companion_app();
+            }
         };
         Task::none()
     }
@@ -365,6 +386,7 @@ impl Window {
         };
 
         list.push(widget::button::text("Settings").on_press(Message::ToggleSettings))
+            .push(widget::button::text("Open PawPause").on_press(Message::OpenApp))
             .into()
     }
 

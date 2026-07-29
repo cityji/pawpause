@@ -1,17 +1,18 @@
 use std::collections::HashSet;
+use std::time::Duration;
 
 mod chart;
 
-use chrono::{Local, NaiveDate};
+use chrono::{Datelike, Local, NaiveDate};
 use cosmic::app::{Core, Settings, Task};
-use cosmic::iced::{Alignment, Length, Size};
+use cosmic::iced::{Alignment, Length, Size, Subscription};
 use cosmic::widget::dropdown::dropdown;
 use cosmic::widget::{self, checkbox, column, icon, nav_bar, row, text, text_input, Space};
 use cosmic::{theme, Element};
 
 use pawpause_applet::config::{self, Config};
 use pawpause_applet::laptop_usage::{self, BootSession};
-use pawpause_applet::stats::{self, format_hhmm};
+use pawpause_applet::stats;
 use pawpause_applet::tasks::{self, TasksStore};
 
 const APP_ID: &str = "com.pawpause.App";
@@ -46,7 +47,19 @@ struct App {
     edit_project: Option<u64>,
 
     new_project_name: String,
+
+    /// Reveal progress for the Statistics page's animated widgets, 0.0..=1.0.
+    /// Canvas has no clock of its own, so this is advanced by a subscription
+    /// tick and passed into each `Program`. It resets whenever the page is
+    /// opened and stops ticking once it reaches 1.0 — an idle window must not
+    /// redraw forever.
+    anim: f32,
 }
+
+/// Reveal duration and tick rate. ~16ms ≈ 60fps; 420ms lands inside the
+/// "responsive, not sluggish" window for a reveal of this size.
+const ANIM_TICK: Duration = Duration::from_millis(16);
+const ANIM_DURATION_SECS: f32 = 0.42;
 
 #[derive(Clone, Debug)]
 enum Message {
@@ -76,6 +89,7 @@ enum Message {
     SetDailyGoal(u32),
     ExportCsv,
     ExportCsvDone,
+    AnimTick,
 }
 
 impl App {
@@ -145,6 +159,7 @@ impl cosmic::Application for App {
             edit_title: String::new(),
             edit_project: None,
             new_project_name: String::new(),
+            anim: 0.0,
         };
 
         (app, Task::none())
@@ -154,12 +169,26 @@ impl cosmic::Application for App {
         Some(&self.nav_model)
     }
 
+    /// Ticks only while a reveal is actually in flight — `Subscription::none()`
+    /// once it settles, so a window left open on the Statistics page costs
+    /// nothing.
+    fn subscription(&self) -> Subscription<Message> {
+        let on_stats = self.nav_model.active_data::<Page>() == Some(&Page::Statistics);
+        if on_stats && self.anim < 1.0 {
+            cosmic::iced::time::every(ANIM_TICK).map(|_| Message::AnimTick)
+        } else {
+            Subscription::none()
+        }
+    }
+
     fn on_nav_select(&mut self, id: nav_bar::Id) -> Task<Message> {
         self.nav_model.activate(id);
         match self.nav_model.active_data::<Page>() {
             Some(Page::Statistics) => {
                 self.sessions = stats::load_sessions();
                 self.boot_sessions = laptop_usage::list_boot_sessions(200);
+                // Replay the reveal each time the page is entered.
+                self.anim = 0.0;
             }
             _ => self.store = tasks::load(),
         }
@@ -290,6 +319,9 @@ impl cosmic::Application for App {
                 );
             }
             Message::ExportCsvDone => {}
+            Message::AnimTick => {
+                self.anim = (self.anim + ANIM_TICK.as_secs_f32() / ANIM_DURATION_SECS).min(1.0);
+            }
         }
         Task::none()
     }
@@ -496,47 +528,134 @@ impl App {
     fn statistics_view(&self) -> Element<'_, Message> {
         let theme = cosmic::theme::active();
         let cosmic_theme = theme.cosmic();
-        let work_color: cosmic::iced::Color = cosmic_theme.destructive_color().into();
+        // Accent, not destructive_color(): the old chart series was drawn in
+        // the theme's *error* red, which read as an alarm rather than as
+        // progress. Success green is reserved for "goal met".
+        let focus_color: cosmic::iced::Color = cosmic_theme.accent_color().into();
+        let done_color: cosmic::iced::Color = cosmic_theme.success_color().into();
         let neutral_color: cosmic::iced::Color = cosmic_theme.bg_component_color().into();
         let text_color: cosmic::iced::Color = cosmic_theme.on_bg_color().into();
 
         let summary = stats::summary(&self.sessions);
-        let breakdown = stats::week_breakdown(&self.sessions);
-        let daily_14 = stats::daily_breakdown(&self.sessions, 14);
-        let daily_84 = stats::daily_breakdown(&self.sessions, 84);
-        let completion = stats::completion_summary(&self.sessions);
-        let laptop_daily = zero_fill_minutes(&laptop_usage::daily_usage_minutes(&self.boot_sessions), 14)
-            .into_iter()
-            .map(|(d, m)| (d, m * 60))
-            .collect::<Vec<_>>();
+        let today = stats::today_seconds(&self.sessions);
+        let goal_minutes = self.config.daily_goal_minutes;
+        let goal_secs = goal_minutes as u64 * 60;
+        let best = stats::best_day(&self.sessions);
 
-        let today_seconds = daily_14.last().map(|(_, s)| *s).unwrap_or(0);
-        let yesterday_seconds = daily_14.get(daily_14.len().saturating_sub(2)).map(|(_, s)| *s).unwrap_or(0);
+        let hero = self.hero_card(today, goal_secs, best, &summary, focus_color, done_color, text_color);
 
-        let tiles = row(Vec::new())
-            .spacing(16)
-            .push(stat_tile("Hours focused", format!("{:.1}", summary.hours_focused)))
-            .push(stat_tile("Days accessed", summary.days_accessed.to_string()))
-            .push(stat_tile("Day streak", summary.day_streak.to_string()))
-            .push(stat_tile("Today vs yesterday", format!("{} / {}", format_hhmm(today_seconds), format_hhmm(yesterday_seconds))));
+        let body = column(Vec::new())
+            .padding(20)
+            .spacing(20)
+            .push(
+                row(Vec::new())
+                    .align_y(Alignment::Center)
+                    .push(text("Your progress").size(22).width(Length::Fill))
+                    .push(widget::button::text("Export CSV").on_press(Message::ExportCsv)),
+            )
+            .push(hero)
+            .push(self.goal_setting_row())
+            .push(self.rhythm_section(focus_color, text_color))
+            .push(self.this_week_section(goal_secs, focus_color, text_color))
+            .push(self.consistency_section(focus_color, text_color))
+            .push(self.uptime_section(neutral_color, text_color));
 
-        let mut goal_section = column(Vec::new()).spacing(6);
-        if self.config.daily_goal_minutes > 0 {
-            let goal_secs = self.config.daily_goal_minutes as u64 * 60;
-            let ratio = (today_seconds as f32 / goal_secs as f32).clamp(0.0, 1.0);
-            goal_section = goal_section
-                .push(text(format!(
-                    "Today's goal: {} / {} min",
-                    today_seconds / 60,
-                    self.config.daily_goal_minutes
-                )))
-                .push(widget::progress_bar::determinate_linear(ratio).girth(Length::Fixed(6.0)).width(Length::Fill));
-        }
-        goal_section = goal_section.push(
+        widget::scrollable(body).into()
+    }
+
+    /// The one metric that matters right now — today against the daily goal —
+    /// given the most visual weight on the page, flanked by streak and
+    /// all-time context so a small "today" still sits inside a bigger story.
+    fn hero_card(
+        &self,
+        today: u64,
+        goal_secs: u64,
+        best: Option<(NaiveDate, u64)>,
+        summary: &stats::Summary,
+        focus_color: cosmic::iced::Color,
+        done_color: cosmic::iced::Color,
+        text_color: cosmic::iced::Color,
+    ) -> Element<'_, Message> {
+        // With the goal switched off there's nothing to fill toward, and the
+        // ring would render as an empty circle with a number floating in it —
+        // the same dead look this redesign exists to remove. Fall back to the
+        // personal best (or a 1-hour default) so the arc always means
+        // something, and say which in the caption.
+        let (ring_target, caption) = if goal_secs > 0 {
+            (goal_secs, format!("of {} goal", stats::format_duration(goal_secs)))
+        } else {
+            match best.map(|(_, s)| s).filter(|s| *s > 0) {
+                Some(best_secs) => (best_secs, format!("of best {}", stats::format_duration(best_secs))),
+                None => (3600, "today".to_string()),
+            }
+        };
+
+        let ring = widget::canvas(chart::GoalRing {
+            today_seconds: today,
+            goal_seconds: ring_target,
+            celebrate: goal_secs > 0,
+            headline: stats::format_duration(today),
+            caption,
+            color: focus_color,
+            accent_done: done_color,
+            text_color,
+            anim: self.anim,
+        })
+        .width(Length::Fixed(150.0))
+        .height(Length::Fixed(150.0));
+
+        let (this_week, last_week) = stats::week_over_week(&self.sessions);
+        let trend_line = match (this_week, last_week) {
+            (0, 0) => "No focus logged this week yet.".to_string(),
+            (t, 0) => format!("{} this week — your first week logging focus.", stats::format_duration(t)),
+            (t, l) if t >= l => format!(
+                "{} this week, up from {} at this point last week.",
+                stats::format_duration(t),
+                stats::format_duration(l)
+            ),
+            (t, l) => format!(
+                "{} this week, {} behind last week's pace.",
+                stats::format_duration(t),
+                stats::format_duration(l - t)
+            ),
+        };
+
+        let side = column(Vec::new())
+            .spacing(10)
+            .push(text(stats::encouragement(today, self.config.daily_goal_minutes, summary.day_streak)).size(15))
+            .push(text(trend_line).size(12))
+            .push(
+                row(Vec::new())
+                    .spacing(24)
+                    .push(mini_metric("Streak", &format!("{} d", summary.day_streak)))
+                    .push(mini_metric("Total focus", &stats::format_duration((summary.hours_focused * 3600.0) as u64)))
+                    .push(mini_metric("Active days", &summary.days_accessed.to_string())),
+            );
+
+        widget::container(
+            row(Vec::new())
+                .spacing(20)
+                .align_y(Alignment::Center)
+                .push(ring)
+                .push(side.width(Length::Fill)),
+        )
+        .class(theme::Container::Card)
+        .padding(20)
+        .width(Length::Fill)
+        .into()
+    }
+
+    fn goal_setting_row(&self) -> Element<'_, Message> {
+        widget::container(
             row(Vec::new())
                 .spacing(8)
                 .align_y(Alignment::Center)
-                .push(text("Daily focus goal").width(Length::Fill))
+                .push(
+                    column(Vec::new())
+                        .push(text("Daily focus goal"))
+                        .push(text("Sets the target the ring above fills toward.").size(11))
+                        .width(Length::Fill),
+                )
                 .push(widget::spin_button::spin_button(
                     if self.config.daily_goal_minutes == 0 {
                         "Off".to_string()
@@ -550,90 +669,202 @@ impl App {
                     600,
                     Message::SetDailyGoal,
                 )),
-        );
+        )
+        .class(theme::Container::Card)
+        .padding(16)
+        .width(Length::Fill)
+        .into()
+    }
 
-        let mut table = widget::list_column();
-        if breakdown.is_empty() {
-            table = table.add(text("No focused time logged this week yet."));
+    /// "When do you actually focus" — a weekday profile that stays meaningful
+    /// on a short history, unlike a 14-day line that's mostly zeros.
+    fn rhythm_section(
+        &self,
+        focus_color: cosmic::iced::Color,
+        text_color: cosmic::iced::Color,
+    ) -> Element<'_, Message> {
+        let today_index = Local::now().date_naive().weekday().num_days_from_monday() as usize;
+        section(
+            "Your rhythm",
+            "Focused time by weekday, last 4 weeks. Today's column is highlighted.",
+            chart_card(
+                widget::canvas(chart::WeekdayProfile {
+                    minutes: stats::weekday_profile(&self.sessions, 4),
+                    today_index,
+                    color: focus_color,
+                    text_color,
+                    anim: self.anim,
+                })
+                .height(Length::Fixed(150.0)),
+            ),
+        )
+    }
+
+    /// Per-project time this week. Bars are normalized against a real ceiling
+    /// (personal best day, or the goal) so a single project no longer renders
+    /// as a permanently full bar.
+    fn this_week_section(
+        &self,
+        goal_secs: u64,
+        focus_color: cosmic::iced::Color,
+        text_color: cosmic::iced::Color,
+    ) -> Element<'_, Message> {
+        let breakdown = stats::week_breakdown(&self.sessions);
+        let multi_project = breakdown.len() > 1;
+
+        // With several projects, comparing them against each other is the
+        // useful question, so the in-chart max is the honest ceiling. With a
+        // single project that's vacuous — it would always fill the row, which
+        // is the bug that made this chart look broken. Measure it against an
+        // external ceiling instead, and crucially a *week*-scale one: these
+        // bars are week totals, so a daily goal or a best *day* would be
+        // outgrown by Wednesday and clamp back to full width.
+        let days_elapsed = Local::now().date_naive().weekday().num_days_from_monday() as u64 + 1;
+        let week_target = goal_secs * days_elapsed;
+        let reference = if multi_project {
+            None
         } else {
-            for (project, seconds) in &breakdown {
-                table = table.add(widget::settings::item_row(vec![
-                    text(project.clone()).width(Length::Fill).into(),
-                    text(format_hhmm(*seconds)).into(),
-                ]));
-            }
-        }
+            Some(week_target.max(1))
+        };
 
-        let week_chart = chart_card(
-            widget::canvas(chart::BarChart {
-                bars: breakdown,
-                color: work_color,
-                text_color,
-                max_bars: 8,
-            })
-            .height(Length::Fixed(160.0)),
-        );
+        let subtitle = if multi_project {
+            "Time per project, Monday to today.".to_string()
+        } else if week_target > 0 {
+            format!(
+                "Time per project, Monday to today — the track is your goal so far this week ({}).",
+                stats::format_duration(week_target)
+            )
+        } else {
+            "Time per project, Monday to today. Set a daily goal to see this as progress.".to_string()
+        };
 
-        let trend_chart = chart_card(
-            widget::canvas(chart::TrendChart {
-                points: daily_14.clone(),
-                color: work_color,
-                text_color,
-                fill: true,
-            })
-            .height(Length::Fixed(140.0)),
-        );
+        let content: Element<'_, Message> = if breakdown.is_empty() {
+            widget::container(text("Nothing logged this week yet — your first session will show up here.").size(13))
+                .class(theme::Container::Card)
+                .padding(16)
+                .width(Length::Fill)
+                .into()
+        } else {
+            let height = 34.0 * breakdown.len().min(8) as f32 + 20.0;
+            chart_card(
+                widget::canvas(chart::BarChart {
+                    bars: breakdown,
+                    color: focus_color,
+                    text_color,
+                    max_bars: 8,
+                    reference,
+                })
+                .height(Length::Fixed(height)),
+            )
+        };
+
+        section("This week", &subtitle, content)
+    }
+
+    /// Streak-shaped view: the heatmap plus an honest completion caption.
+    fn consistency_section(
+        &self,
+        focus_color: cosmic::iced::Color,
+        text_color: cosmic::iced::Color,
+    ) -> Element<'_, Message> {
+        let completion = stats::completion_summary(&self.sessions);
+        let finished = completion.completed;
+        let total_known = finished + completion.skipped_or_stopped;
+        let caption = if total_known == 0 {
+            "No finished sessions recorded yet.".to_string()
+        } else {
+            format!(
+                "{finished} of {total_known} sessions run to completion ({}%).",
+                (finished as f32 / total_known as f32 * 100.0).round() as u32
+            )
+        };
 
         let heatmap = chart_card(
             widget::canvas(chart::HeatmapCalendar {
-                days: daily_84,
-                base_color: work_color,
+                days: stats::daily_breakdown(&self.sessions, 84),
+                base_color: focus_color,
                 text_color,
                 weeks: 12,
             })
-            .height(Length::Fixed(120.0)),
+            .height(Length::Fixed(130.0)),
         );
 
-        let laptop_chart = chart_card(
-            widget::canvas(chart::TrendChart {
-                points: laptop_daily,
-                color: neutral_color,
-                text_color,
-                fill: true,
-            })
-            .height(Length::Fixed(140.0)),
-        );
-
-        let completion_caption = text(format!(
-            "{} completed · {} skipped/stopped · {} from before completion-tracking",
-            completion.completed, completion.skipped_or_stopped, completion.unknown
-        ))
-        .size(12);
-
-        let body = column(Vec::new())
-            .padding(16)
-            .spacing(16)
-            .push(
-                row(Vec::new())
-                    .align_y(Alignment::Center)
-                    .push(text("Activity Summary").size(20).width(Length::Fill))
-                    .push(widget::button::text("Export CSV").on_press(Message::ExportCsv)),
-            )
-            .push(tiles)
-            .push(goal_section)
-            .push(text("Focus Hours This Week").size(16))
-            .push(week_chart)
-            .push(table)
-            .push(text("Daily Focus — Last 14 Days").size(16))
-            .push(trend_chart)
-            .push(completion_caption)
-            .push(text("Focus Activity — Last 12 Weeks").size(16))
-            .push(heatmap)
-            .push(text("Laptop Usage — Last 14 Days").size(16))
-            .push(laptop_chart);
-
-        widget::scrollable(body).into()
+        section(
+            "Consistency",
+            "Every day of the last 12 weeks. Rows are weekdays, Monday at the top.",
+            column(Vec::new()).spacing(8).push(heatmap).push(text(caption).size(12)).into(),
+        )
     }
+
+    /// Machine uptime. Deliberately *not* called "usage": a suspended laptop
+    /// still counts as up, so this measures how long the machine ran, not how
+    /// long it was worked on. Hidden entirely when `last`'s history is too
+    /// short to fill the window — charting rotated-away days as flat zero
+    /// implied "laptop was off", which is exactly the unreliability that made
+    /// this card untrustworthy.
+    fn uptime_section(
+        &self,
+        neutral_color: cosmic::iced::Color,
+        text_color: cosmic::iced::Color,
+    ) -> Element<'_, Message> {
+        const WINDOW_DAYS: u32 = 14;
+        let Some(history_start) = laptop_usage::history_starts_on(&self.boot_sessions) else {
+            return Space::new().height(Length::Fixed(0.0)).into();
+        };
+
+        let today = Local::now().date_naive();
+        let covered = (today - history_start).num_days().max(0) as u32 + 1;
+        let days = covered.min(WINDOW_DAYS);
+        if days < 2 {
+            return Space::new().height(Length::Fixed(0.0)).into();
+        }
+
+        let points = zero_fill_minutes(&laptop_usage::daily_usage_minutes(&self.boot_sessions), days)
+            .into_iter()
+            .map(|(d, m)| (d, m * 60))
+            .collect::<Vec<_>>();
+
+        let subtitle = if covered < WINDOW_DAYS {
+            format!("Hours the machine was powered on. Boot history only goes back {days} days.")
+        } else {
+            format!("Hours the machine was powered on, last {days} days. Includes time spent suspended.")
+        };
+
+        section(
+            "Uptime",
+            &subtitle,
+            chart_card(
+                widget::canvas(chart::TrendChart {
+                    points,
+                    color: neutral_color,
+                    text_color,
+                    fill: true,
+                })
+                .height(Length::Fixed(130.0)),
+            ),
+        )
+    }
+}
+
+/// A titled section: heading, one explanatory line, then the content. The
+/// subtitle is load-bearing — every chart on this page now states its own
+/// scope, since unlabeled mixed-scope metrics were a large part of why the
+/// old page couldn't be trusted.
+fn section<'a>(title: &'a str, subtitle: &str, content: Element<'a, Message>) -> Element<'a, Message> {
+    column(Vec::new())
+        .spacing(8)
+        .push(text(title).size(16))
+        .push(text(subtitle.to_string()).size(11))
+        .push(content)
+        .into()
+}
+
+fn mini_metric<'a>(label: &str, value: &str) -> Element<'a, Message> {
+    column(Vec::new())
+        .spacing(2)
+        .push(text(value.to_string()).size(18))
+        .push(text(label.to_string()).size(11))
+        .into()
 }
 
 fn chart_card<'a>(
@@ -659,20 +890,6 @@ fn zero_fill_minutes(daily: &[(NaiveDate, u64)], days: u32) -> Vec<(NaiveDate, u
             (date, totals.get(&date).copied().unwrap_or(0))
         })
         .collect()
-}
-
-fn stat_tile<'a>(label: &'a str, value: String) -> Element<'a, Message> {
-    widget::container(
-        column(Vec::new())
-            .align_x(Alignment::Center)
-            .spacing(4)
-            .push(text(value).size(28))
-            .push(text(label)),
-    )
-    .class(theme::Container::Card)
-    .padding(12)
-    .width(Length::Fill)
-    .into()
 }
 
 fn main() -> cosmic::iced::Result {

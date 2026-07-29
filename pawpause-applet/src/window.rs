@@ -50,6 +50,33 @@ pub struct Window {
     /// when the break ends. In-memory only: a crash mid-break leaves the
     /// wallpaper blurred until the next full break cycle completes.
     wallpaper_backup: Option<WallpaperBackup>,
+    /// Today's focus/streak/active-task, refreshed when the popup opens and
+    /// when a work phase ends — never on the 1-second tick. This process runs
+    /// for the whole session, so re-reading `sessions.json` every second to
+    /// render a panel popup that is usually closed would be pure waste.
+    glance: Glance,
+}
+
+/// The small set of numbers the popup shows while idle, so clicking the
+/// applet with no timer running still surfaces progress instead of a dead
+/// 0% bar.
+#[derive(Default)]
+pub struct Glance {
+    today_seconds: u64,
+    streak: u32,
+    active_task: Option<String>,
+}
+
+impl Glance {
+    fn load() -> Self {
+        let sessions = stats::load_sessions();
+        let store = tasks::load();
+        Self {
+            today_seconds: stats::today_seconds(&sessions),
+            streak: stats::summary(&sessions).day_streak,
+            active_task: store.active_task_title().map(str::to_string),
+        }
+    }
 }
 
 impl Default for Window {
@@ -70,6 +97,7 @@ impl Default for Window {
             settings_open: false,
             available_outputs: Vec::new(),
             wallpaper_backup: None,
+            glance: Glance::default(),
         }
     }
 }
@@ -114,6 +142,9 @@ impl Window {
         if old_phase == Some(Phase::Work) && old_phase_elapsed_secs > 0 {
             let project = tasks::load().active_project_name();
             stats::log_session(&project, old_phase_elapsed_secs as u64, completed);
+            // Today's total just changed — refresh here rather than letting
+            // the popup show a stale figure until it's next reopened.
+            self.glance = Glance::load();
         }
 
         if old_phase.is_some_and(Phase::is_break) {
@@ -383,6 +414,8 @@ impl cosmic::Application for Window {
                     move |state: &mut Window| {
                         let new_id = Id::unique();
                         state.popup = Some(new_id);
+                        // Cheap disk read, once per popup open — not per tick.
+                        state.glance = Glance::load();
                         let mut popup_settings = state.core.applet.get_popup_settings(
                             state.core.main_window_id().unwrap(),
                             new_id,
@@ -440,34 +473,53 @@ impl Window {
         let theme = cosmic::theme::active();
         let phase = self.pomodoro.phase;
         let accent = phase_color(&theme, phase);
+        let idle = self.pomodoro.state == RunState::Idle && phase.is_none();
 
-        let phase_label = match (phase, self.pomodoro.state) {
-            (None, _) => "Idle".to_string(),
-            (Some(p), RunState::Paused) => format!("{} (paused)", p.label()),
-            (Some(p), _) => p.label().to_string(),
+        // Idle used to render the running layout with everything zeroed — a
+        // 0% bar and an empty dot row, which read as "broken" rather than
+        // "ready". Idle now gets its own surface built from today's numbers.
+        let hero: Element<'_, Message> = if idle {
+            self.idle_hero(&theme)
+        } else {
+            let phase_label = match (phase, self.pomodoro.state) {
+                (None, _) => "Idle".to_string(),
+                (Some(p), RunState::Paused) => format!("{} (paused)", p.label()),
+                (Some(p), _) => p.label().to_string(),
+            };
+            container(
+                column(Vec::new())
+                    .align_x(Alignment::Center)
+                    .spacing(4)
+                    .push(text::heading(phase_label))
+                    .push(text::title1(self.pomodoro.short_time_text())),
+            )
+            .width(Length::Fill)
+            .padding([16, 20])
+            .align_x(Alignment::Center)
+            .style(colored_bg(muted(accent, 0.3), 12.0))
+            .into()
         };
 
-        let timer_card = container(
-            column(Vec::new())
-                .align_x(Alignment::Center)
-                .spacing(4)
-                .push(text::heading(phase_label))
-                .push(text::title1(self.pomodoro.short_time_text())),
-        )
-        .width(Length::Fill)
-        .padding([16, 20])
-        .align_x(Alignment::Center)
-        .style(colored_bg(muted(accent, 0.3), 12.0));
+        let mut body = column(Vec::new())
+            .padding(10)
+            .spacing(10)
+            .align_x(Alignment::Center)
+            .push(hero);
 
-        let progress_bar = widget::progress_bar::determinate_linear(self.progress())
-            .girth(Length::Fixed(6.0))
-            .width(Length::Fill);
+        if !idle {
+            body = body.push(
+                widget::progress_bar::determinate_linear(self.progress())
+                    .girth(Length::Fixed(6.0))
+                    .width(Length::Fill),
+            );
 
-        let goal = self.config.sessions_before_long_break.max(1);
-        let filled = self.completed_in_cycle(goal);
-        let mut dots = row(Vec::new()).spacing(6).align_y(Alignment::Center);
-        for i in 0..goal {
-            dots = dots.push(dot(i < filled, accent));
+            let goal = self.config.sessions_before_long_break.max(1);
+            let filled = self.completed_in_cycle(goal);
+            let mut dots = row(Vec::new()).spacing(6).align_y(Alignment::Center);
+            for i in 0..goal {
+                dots = dots.push(dot(i < filled, accent));
+            }
+            body = body.push(dots);
         }
 
         let toggle_label = match self.pomodoro.state {
@@ -476,8 +528,12 @@ impl Window {
             RunState::Idle => "Pause",
         };
         let actions: Element<'_, Message> = if self.pomodoro.state == RunState::Idle {
+            let label = match self.glance.active_task.as_deref() {
+                Some(_) => "Start focusing",
+                None => "Start Pomodoro",
+            };
             row(Vec::new())
-                .push(widget::button::suggested("Start Pomodoro").on_press(Message::Start))
+                .push(widget::button::suggested(label).on_press(Message::Start))
                 .into()
         } else {
             row(Vec::new())
@@ -488,14 +544,7 @@ impl Window {
                 .into()
         };
 
-        column(Vec::new())
-            .padding(10)
-            .spacing(10)
-            .align_x(Alignment::Center)
-            .push(timer_card)
-            .push(progress_bar)
-            .push(dots)
-            .push(actions)
+        body.push(actions)
             .push(widget::divider::horizontal::default())
             .push(
                 row(Vec::new())
@@ -503,6 +552,86 @@ impl Window {
                     .push(widget::button::text("Settings").on_press(Message::ToggleSettings))
                     .push(widget::button::text("Open PawPause").on_press(Message::OpenApp)),
             )
+            .into()
+    }
+
+    /// The idle surface: today's progress toward the daily goal as a segmented
+    /// meter, the streak, an encouraging line, and whatever task is starred —
+    /// so opening the applet between sessions shows where you stand and what
+    /// to pick up, not a dead clock.
+    fn idle_hero(&self, theme: &Theme) -> Element<'_, Message> {
+        let palette = theme.cosmic();
+        let accent: Color = palette.accent_color().into();
+        let success: Color = palette.success_color().into();
+        let today = self.glance.today_seconds;
+        let goal_minutes = self.config.daily_goal_minutes;
+        let goal_secs = goal_minutes as u64 * 60;
+        let met = goal_secs > 0 && today >= goal_secs;
+        let bar_color = if met { success } else { accent };
+
+        let mut card = column(Vec::new())
+            .spacing(8)
+            .align_x(Alignment::Center)
+            .push(text::heading(if met {
+                "Goal met today".to_string()
+            } else {
+                format!("{} focused today", stats::format_duration(today))
+            }));
+
+        // With the goal off, fall back to an hour so there's still a bar to
+        // fill rather than a bare number — but label it as a reference, not
+        // as a goal the user set.
+        let (target, target_label) = if goal_secs > 0 {
+            (goal_secs, "daily goal")
+        } else {
+            (3600, "today")
+        };
+        let ratio = (today as f32 / target as f32).clamp(0.0, 1.0);
+        card = card
+            .push(
+                widget::progress_bar::determinate_linear(ratio)
+                    .girth(Length::Fixed(6.0))
+                    .width(Length::Fill),
+            )
+            .push(
+                text(format!(
+                    "{} of {} {target_label}",
+                    stats::format_duration(today),
+                    stats::format_duration(target)
+                ))
+                .size(11),
+            );
+
+        // Streak pips: a compact "last 7 days of momentum" read that grows
+        // as the streak does, capped so a long streak can't overflow the pill.
+        if self.glance.streak > 0 {
+            let shown = self.glance.streak.min(7);
+            let mut pips = row(Vec::new()).spacing(4).align_y(Alignment::Center);
+            for _ in 0..shown {
+                pips = pips.push(dot(true, bar_color));
+            }
+            card = card.push(
+                row(Vec::new())
+                    .spacing(6)
+                    .align_y(Alignment::Center)
+                    .push(pips)
+                    .push(text(format!("{}-day streak", self.glance.streak)).size(11)),
+            );
+        }
+
+        card = card.push(
+            text(stats::encouragement(today, goal_minutes, self.glance.streak)).size(11),
+        );
+
+        if let Some(task) = self.glance.active_task.as_deref() {
+            card = card.push(text(format!("Next up: {task}")).size(12));
+        }
+
+        container(card)
+            .width(Length::Fill)
+            .padding([14, 16])
+            .align_x(Alignment::Center)
+            .style(colored_bg(muted(bar_color, 0.18), 12.0))
             .into()
     }
 

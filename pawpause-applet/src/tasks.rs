@@ -56,6 +56,14 @@ impl TasksStore {
             .to_string()
     }
 
+    /// The starred task's title, if one is set — shown in the applet popup so
+    /// starting a session names what you're about to work on.
+    pub fn active_task_title(&self) -> Option<&str> {
+        self.active_task_id
+            .and_then(|id| self.tasks.iter().find(|t| t.id == id))
+            .map(|t| t.title.as_str())
+    }
+
     pub fn children_of(&self, id: u64) -> Vec<&Task> {
         self.tasks.iter().filter(|t| t.parent_id == Some(id)).collect()
     }
